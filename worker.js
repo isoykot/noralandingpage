@@ -1658,7 +1658,7 @@ async function apiRoutes(request, env, path) {
       return fail(401, "ইউজারনেম বা পাসওয়ার্ড ভুল!");
     }
 
-    await clearRateLimits(env.DB, [ipKey, userKey]);
+    await clearRateLimits(env.DB, [userKey]);
     await audit(env, user.username, "login_ok", "", rawIp);
     await env.DB.prepare("DELETE FROM audit_log WHERE created_at < datetime('now', '-90 days')").run();
     const token = await createSession(env, user.id);
