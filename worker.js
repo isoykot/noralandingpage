@@ -27,6 +27,11 @@ const PAGE_SIZE = 30;
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const PBKDF2_ITER = 100000;
 const LOGIN_FAIL_LIMIT = 20;
+const LOGIN_IP_FAIL_LIMIT = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const ORDER_IP_LIMIT = 25;
+const PHONE_ATTEMPT_LIMIT = 12;
+const ORDER_WINDOW_MS = 60 * 60 * 1000;
 const PHONE_ORDER_LIMIT = 5;
 const COUPON_REWARD_DAYS = 30;
 const LOW_STOCK = 5;
@@ -697,6 +702,29 @@ function getIp(request) {
   return request.headers.get("CF-Connecting-IP") || "unknown";
 }
 
+async function getRateLimitHits(db, key, windowMs) {
+  const row = await db.prepare("SELECT hits, window_start FROM rate_limits WHERE rate_key = ?").bind(key).first();
+  if (!row || Date.now() - Number(row.window_start) >= windowMs) return 0;
+  return Number(row.hits) || 0;
+}
+
+async function incrementRateLimit(db, key, windowMs) {
+  const now = Date.now();
+  await db.batch([
+    db.prepare("DELETE FROM rate_limits WHERE window_start < ?").bind(now - 48 * 60 * 60 * 1000),
+    db.prepare(`INSERT INTO rate_limits (rate_key, hits, window_start) VALUES (?, 1, ?)
+      ON CONFLICT(rate_key) DO UPDATE SET
+        hits = CASE WHEN rate_limits.window_start + ? <= ? THEN 1 ELSE rate_limits.hits + 1 END,
+        window_start = CASE WHEN rate_limits.window_start + ? <= ? THEN ? ELSE rate_limits.window_start END`)
+      .bind(key, now, windowMs, now, windowMs, now, now)
+  ]);
+  return getRateLimitHits(db, key, windowMs);
+}
+
+async function clearRateLimits(db, keys) {
+  if (keys.length) await db.batch(keys.map((key) => db.prepare("DELETE FROM rate_limits WHERE rate_key = ?").bind(key)));
+}
+
 function cleanImages(list) {
   if (!Array.isArray(list)) return [];
   return list
@@ -931,6 +959,11 @@ async function ensureSchema(env) {
       user_id INTEGER NOT NULL,
       expires_at INTEGER NOT NULL
     )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS rate_limits (
+      rate_key TEXT PRIMARY KEY,
+      hits INTEGER NOT NULL DEFAULT 0,
+      window_start INTEGER NOT NULL
+    )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS settings (
       k TEXT PRIMARY KEY,
       v TEXT
@@ -1054,11 +1087,15 @@ async function ensureSchema(env) {
     const prod = await db.prepare("SELECT colors, sizes, stock FROM product WHERE id = 1").first();
     const cl = prod ? splitList(prod.colors) : [];
     const sl = prod ? splitList(prod.sizes) : [];
+    const legacyStock = Math.max(0, Number(prod && prod.stock) || 0);
     if (cl.length === 0 && sl.length === 0) {
       await db.prepare("INSERT OR IGNORE INTO inventory (color, size, qty) VALUES ('', '', ?)")
-        .bind(Math.max(0, Number(prod && prod.stock) || 0)).run();
+        .bind(legacyStock).run();
     } else {
+      // Legacy stock is aggregate-only; preserve it on the first valid variant.
       await syncInventory(db, cl, sl);
+      await db.prepare("UPDATE inventory SET qty = ? WHERE color = ? AND size = ?")
+        .bind(legacyStock, cl[0] || "", sl[0] || "").run();
     }
     await syncTotal(db);
   }
@@ -1591,29 +1628,37 @@ async function apiRoutes(request, env, path) {
 
   if (path === "/api/admin/login" && m === "POST") {
     const ipHash = await hashIp(env, rawIp);
-    const recent = await env.DB.prepare(
-      "SELECT COUNT(*) AS c FROM audit_log WHERE action = 'login_fail' AND ip_hash = ? AND created_at > datetime('now', '-15 minutes')"
-    ).bind(ipHash).first();
-    if (recent && recent.c >= LOGIN_FAIL_LIMIT) {
-      return fail(429, "অনেকবার ভুল চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।");
-    }
-
+    const ipKey = "login:ip:" + ipHash;
     const body = await readJson(request);
     const username = String(body.username ?? "").trim().toLowerCase().slice(0, 40);
     const password = String(body.password ?? "");
     if (!username || !password) return fail(400, "ইউজারনেম ও পাসওয়ার্ড দিন!");
+    if (password.length > 200) return fail(400, "পাসওয়ার্ড ৮–২০০ অক্ষরের হতে হবে!");
+
+    const userKey = "login:user:" + await blindIndex(env, "login-user", username);
+    const [ipFails, userFails] = await Promise.all([
+      getRateLimitHits(env.DB, ipKey, LOGIN_WINDOW_MS),
+      getRateLimitHits(env.DB, userKey, LOGIN_WINDOW_MS)
+    ]);
+    if (ipFails >= LOGIN_IP_FAIL_LIMIT || userFails >= LOGIN_FAIL_LIMIT) {
+      return fail(429, "অনেকবার ভুল চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।");
+    }
 
     const user = await env.DB.prepare(
       "SELECT id, username, password_hash, salt FROM admin_users WHERE username = ?"
     ).bind(username).first();
-
     const hash = await hashPassword(password, user ? user.salt : "00".repeat(16));
     const ok = !!user && safeEqual(hash, user.password_hash);
     if (!ok) {
+      await Promise.all([
+        incrementRateLimit(env.DB, ipKey, LOGIN_WINDOW_MS),
+        incrementRateLimit(env.DB, userKey, LOGIN_WINDOW_MS)
+      ]);
       await audit(env, username, "login_fail", "", rawIp);
       return fail(401, "ইউজারনেম বা পাসওয়ার্ড ভুল!");
     }
 
+    await clearRateLimits(env.DB, [ipKey, userKey]);
     await audit(env, user.username, "login_ok", "", rawIp);
     await env.DB.prepare("DELETE FROM audit_log WHERE created_at < datetime('now', '-90 days')").run();
     const token = await createSession(env, user.id);
@@ -1873,21 +1918,27 @@ async function apiRoutes(request, env, path) {
 
   if (path === "/api/order" && m === "POST") {
     const b = await readJson(request);
-
     const name = String(b.name ?? "").trim();
     const address = String(b.address ?? "").trim();
-    const phone = String(b.phone ?? "").replace(/[\s-]/g, "");
+    const phone = String(b.phone ?? "").replace(/[\\s-]/g, "");
     const area = b.area;
     const qty = Math.min(MAX_QTY, Math.max(1, toInt(b.quantity, 1)));
 
     if (name.length < 2 || name.length > 100) throw new HttpError(400, "সঠিক নাম লিখুন!");
     if (address.length < 5 || address.length > 500) throw new HttpError(400, "সম্পূর্ণ ঠিকানা লিখুন!");
-    if (!/^01[3-9]\d{8}$/.test(phone)) throw new HttpError(400, "সঠিক মোবাইল নাম্বার দিন (01XXXXXXXXX)!");
-    if (area !== "inside" && area !== "outside") {
-      throw new HttpError(400, "দয়া করে ডেলিভারি এরিয়া সিলেক্ট করুন!");
-    }
+    if (!/^01[3-9]\\d{8}$/.test(phone)) throw new HttpError(400, "সঠিক মোবাইল নাম্বার দিন (01XXXXXXXXX)!");
+    if (area !== "inside" && area !== "outside") throw new HttpError(400, "দয়া করে ডেলিভারি এরিয়া সিলেক্ট করুন!");
 
     const phoneIdx = await blindIndex(env, "phone", phone);
+    const ipHash = await hashIp(env, rawIp);
+    const [ipAttempts, phoneAttempts] = await Promise.all([
+      incrementRateLimit(env.DB, "order:ip:" + ipHash, ORDER_WINDOW_MS),
+      incrementRateLimit(env.DB, "order:phone:" + phoneIdx, ORDER_WINDOW_MS)
+    ]);
+    if (ipAttempts > ORDER_IP_LIMIT || phoneAttempts > PHONE_ATTEMPT_LIMIT) {
+      throw new HttpError(429, "এই উৎস থেকে অনেক অর্ডারের চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।");
+    }
+
     const recentPhone = await env.DB.prepare(
       "SELECT COUNT(*) AS c FROM orders WHERE phone_hash = ? AND created_at > datetime('now', '-1 hour')"
     ).bind(phoneIdx).first();
@@ -1905,53 +1956,28 @@ async function apiRoutes(request, env, path) {
     const sizeList = splitList(product.sizes);
     const rawItems = Array.isArray(b.items) ? b.items : [];
     const fallback = { color: String(b.color ?? "").trim(), size: String(b.size ?? "").trim() };
-
-    // প্রতিটি পিসের কালার/সাইজ আলাদা করে একই কালার/সাইজকে এক লাইনে গোছানো
     const lineMap = new Map();
     for (let i = 0; i < qty; i++) {
       const it = rawItems[i] || fallback;
       const c = colorList.length ? String(it.color ?? "").trim() : "";
-      const s = sizeList.length ? String(it.size ?? "").trim() : "";
-      if (colorList.length > 0 && !colorList.includes(c)) throw new HttpError(400, "সঠিক কালার সিলেক্ট করুন!");
-      if (sizeList.length > 0 && !sizeList.includes(s)) throw new HttpError(400, "সঠিক সাইজ সিলেক্ট করুন!");
-      const key = c + "|" + s;
-      if (!lineMap.has(key)) lineMap.set(key, { color: c, size: s, qty: 0 });
+      const sz = sizeList.length ? String(it.size ?? "").trim() : "";
+      if (colorList.length && !colorList.includes(c)) throw new HttpError(400, "সঠিক কালার সিলেক্ট করুন!");
+      if (sizeList.length && !sizeList.includes(sz)) throw new HttpError(400, "সঠিক সাইজ সিলেক্ট করুন!");
+      const key = c + "|" + sz;
+      if (!lineMap.has(key)) lineMap.set(key, { color: c, size: sz, qty: 0 });
       lineMap.get(key).qty += 1;
     }
     const lines = [...lineMap.values()];
 
     const quote = await computeQuote(env, product, qty, area, b.coupon, phone);
     if (quote.couponError) throw new HttpError(400, quote.couponError);
-    if (quote.couponPending) throw new HttpError(400, "কুপন ব্যবহারের জন্য সঠিক ফোন নাম্বার দিন।");
-
-    // প্রতিটি লাইনের স্টক আলাদাভাবে ধরা; কোথাও ব্যর্থ হলে আগেরগুলো ফেরত
-    const taken = [];
-    const restoreTaken = async () => {
-      for (const l of taken) await addStockStmt(env.DB, l.color, l.size, l.qty).run();
-    };
-    for (const l of lines) {
-      const row = await env.DB.prepare("SELECT qty FROM inventory WHERE color = ? AND size = ?").bind(l.color, l.size).first();
-      if (!row) {
-        await restoreTaken();
-        throw new HttpError(400, "🙏 দুঃখিত, এই অপশনটি এখন পাওয়া যাচ্ছে না। অন্য অপশন বেছে নিন।");
-      }
-      if (!(await takeStock(env.DB, l.color, l.size, l.qty))) {
-        await restoreTaken();
-        throw new HttpError(400, stockOutMessage(colorList.length > 0, sizeList.length > 0, l.qty, Number(row.qty) || 0, l.color, l.size));
-      }
-      taken.push(l);
-    }
+    if (quote.couponPending) throw new HttpError(400, "কুপন ব্যবহারের জন্য সঠিক ফোন নাম্বার দিন!");
 
     let couponRow = null;
     if (quote.coupon) {
-      couponRow = (await checkCoupon(env, b.coupon, phone)).row;
-      const used = await env.DB.prepare(
-        "UPDATE coupons SET uses = uses + 1 WHERE id = ? AND active = 1 AND (max_uses = 0 OR uses < max_uses)"
-      ).bind(couponRow.id).run();
-      if (!used.meta || used.meta.changes === 0) {
-        await restoreTaken();
-        throw new HttpError(400, "এই কুপনটি এইমাত্র ব্যবহার হয়ে গেছে।");
-      }
+      const checked = await checkCoupon(env, b.coupon, phone);
+      if (checked.error || !checked.row) throw new HttpError(400, checked.error || "এই কুপনটি এইমাত্র ব্যবহার হয়ে গেছে।");
+      couponRow = checked.row;
     }
 
     const prev = await env.DB.prepare("SELECT COUNT(*) AS c FROM orders WHERE phone_hash = ?").bind(phoneIdx).first();
@@ -1962,54 +1988,88 @@ async function apiRoutes(request, env, path) {
     const selColor = [...new Set(lines.map((l) => l.color).filter(Boolean))].join(", ") || "N/A";
     const selSize = [...new Set(lines.map((l) => l.size).filter(Boolean))].join(", ") || "N/A";
     const linesJson = JSON.stringify(lines);
-
     const encName = await encryptField(env, name);
     const encPhone = await encryptField(env, phone);
     const encAddr = await encryptField(env, address);
     const nameIdx = await blindIndex(env, "name", name);
+    const nowIso = new Date().toISOString();
 
-    let publicId = null;
-    try {
-      for (let attempt = 0; attempt < 3 && !publicId; attempt++) {
-        const candidate = newPublicId();
-        try {
-          await env.DB.prepare(
-            `INSERT INTO orders (public_id, customer_name, phone, address, selected_color, selected_size,
-              delivery_area, delivery_charge, quantity, total, status, phone_hash, name_hash, enc_v,
-              subtotal, bulk_discount, coupon_discount, coupon_code, lines_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, '1', ?, ?, ?, ?, ?)`
-          ).bind(
-            candidate, encName, encPhone, encAddr, selColor, selSize,
-            deliveryAreaText, quote.delivery, qty, quote.total, phoneIdx, nameIdx,
-            quote.subtotal, quote.bulk, couponAmount, couponCode, linesJson
-          ).run();
-          publicId = candidate;
-        } catch (err) {
-          if (!/UNIQUE/i.test(String(err && err.message))) throw err;
+    const stockChecks = lines.map(() =>
+      "AND EXISTS (SELECT 1 FROM inventory WHERE color = ? AND size = ? AND qty >= ?)"
+    ).join(" ");
+    const couponCheck = couponRow
+      ? "AND EXISTS (SELECT 1 FROM coupons WHERE id = ? AND active = 1 AND (max_uses = 0 OR uses < max_uses) AND (expires_at IS NULL OR expires_at > ?) AND (is_personal = 0 OR owner_hash = ?))"
+      : "";
+
+    let publicId = "";
+    for (let attempt = 0; attempt < 3 && !publicId; attempt++) {
+      const candidate = newPublicId();
+      const insert = env.DB.prepare(
+        `INSERT INTO orders (public_id, customer_name, phone, address, selected_color, selected_size,
+          delivery_area, delivery_charge, quantity, total, status, phone_hash, name_hash, enc_v,
+          subtotal, bulk_discount, coupon_discount, coupon_code, lines_json)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, '1', ?, ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM product WHERE id = 1 AND is_active = 1)
+         ${stockChecks} ${couponCheck}`
+      ).bind(
+        candidate, encName, encPhone, encAddr, selColor, selSize,
+        deliveryAreaText, quote.delivery, qty, quote.total, phoneIdx, nameIdx,
+        quote.subtotal, quote.bulk, couponAmount, couponCode, linesJson,
+        ...lines.flatMap((l) => [l.color, l.size, l.qty]),
+        ...(couponRow ? [couponRow.id, nowIso, phoneIdx] : [])
+      );
+
+      const statements = [insert];
+      for (const l of lines) {
+        statements.push(env.DB.prepare(
+          "UPDATE inventory SET qty = qty - ? WHERE color = ? AND size = ? AND qty >= ? AND EXISTS (SELECT 1 FROM orders WHERE public_id = ?)"
+        ).bind(l.qty, l.color, l.size, l.qty, candidate));
+      }
+      if (couponRow) {
+        statements.push(env.DB.prepare(
+          "UPDATE coupons SET uses = uses + 1 WHERE id = ? AND EXISTS (SELECT 1 FROM orders WHERE public_id = ?)"
+        ).bind(couponRow.id, candidate));
+      }
+      statements.push(env.DB.prepare(
+        "UPDATE product SET stock = (SELECT COALESCE(SUM(qty), 0) FROM inventory) WHERE id = 1 AND EXISTS (SELECT 1 FROM orders WHERE public_id = ?)"
+      ).bind(candidate));
+
+      try {
+        const results = await env.DB.batch(statements);
+        if (results[0]?.meta?.changes === 1) publicId = candidate;
+      } catch (err) {
+        if (/UNIQUE/i.test(String(err && err.message)) && attempt < 2) continue;
+        console.error("Atomic order batch failed", err);
+        throw new HttpError(500, "অর্ডার সেভ করতে সমস্যা হয়েছে, আবার চেষ্টা করুন।");
+      }
+    }
+
+    if (!publicId) {
+      const currentProduct = await env.DB.prepare("SELECT is_active FROM product WHERE id = 1").first();
+      if (!currentProduct || Number(currentProduct.is_active) === 0) {
+        throw new HttpError(400, "এই মুহূর্তে প্রোডাক্টটি অর্ডারের জন্য বন্ধ আছে।");
+      }
+      if (couponRow) {
+        const checked = await checkCoupon(env, b.coupon, phone);
+        if (checked.error || !checked.row) throw new HttpError(400, checked.error || "এই কুপনটি এইমাত্র ব্যবহার হয়ে গেছে।");
+      }
+      for (const l of lines) {
+        const row = await env.DB.prepare("SELECT qty FROM inventory WHERE color = ? AND size = ?")
+          .bind(l.color, l.size).first();
+        if (!row) throw new HttpError(400, "🙏 দুঃখিত, এই অপশনটি এখন পাওয়া যাচ্ছে না। অন্য অপশন বেছে নিন।");
+        if (Number(row.qty) < l.qty) {
+          throw new HttpError(400, stockOutMessage(colorList.length > 0, sizeList.length > 0, l.qty, Number(row.qty) || 0, l.color, l.size));
         }
       }
-      if (!publicId) throw new Error("public id generation failed");
-    } catch (err) {
-      await restoreTaken();
-      if (couponRow) await env.DB.prepare("UPDATE coupons SET uses = uses - 1 WHERE id = ?").bind(couponRow.id).run();
-      console.error("Order insert failed", err);
-      throw new HttpError(500, "অর্ডার সেভ করতে সমস্যা হয়েছে, আবার চেষ্টা করুন।");
+      throw new HttpError(409, "অর্ডারটি প্রসেস করা যায়নি। আবার চেষ্টা করুন।");
     }
 
-    await syncTotal(env.DB);
     await audit(env, "customer", "order_create", publicId, rawIp);
-
     let reward = null;
-    try {
-      reward = await issueReward(env, phoneIdx, isFirst, publicId);
-    } catch (e) {
-      console.error("Reward failed", e);
-    }
-    try {
-      await notifyNewOrder(env, { publicId, name, total: quote.total });
-    } catch (e) {
-      console.error("Push failed", e);
-    }
+    try { reward = await issueReward(env, phoneIdx, isFirst, publicId); }
+    catch (e) { console.error("Reward failed", e); }
+    try { await notifyNewOrder(env, { publicId, name, total: quote.total }); }
+    catch (e) { console.error("Push failed", e); }
 
     let giveaway = null;
     try { giveaway = await publicGiveaway(env); } catch (e) { console.error("Giveaway failed", e); }
@@ -2023,34 +2083,52 @@ async function apiRoutes(request, env, path) {
     const b = await readJson(request);
     const pid = normalizeSearch(b.publicId);
     const status = String(b.status ?? "");
-
     if (!PUBLIC_ID_RE.test(pid)) throw new HttpError(400, "অর্ডার আইডি সঠিক নয়!");
     if (!STATUSES.includes(status)) throw new HttpError(400, "Invalid status");
 
-    const order = await env.DB.prepare(
-      "SELECT id, status, quantity FROM orders WHERE public_id = ?"
-    ).bind(pid).first();
+    const order = await env.DB.prepare("SELECT id, status, quantity FROM orders WHERE public_id = ?").bind(pid).first();
     if (!order) throw new HttpError(404, "অর্ডার পাওয়া যায়নি!");
-
-    const wasCancelled = order.status === "Cancelled";
-    const nowCancelled = status === "Cancelled";
-    const setStatus = env.DB.prepare("UPDATE orders SET status = ? WHERE id = ?").bind(status, order.id);
     const lines = await getOrderLines(env, order.id, order.quantity);
 
-    if (!wasCancelled && nowCancelled) {
-      const stmts = lines.map((l) => addStockStmt(env.DB, l.color, l.size, l.qty));
-      stmts.push(setStatus, syncTotalStmt(env.DB));
+    if (status === "Cancelled") {
+      const stmts = lines.map((l) => env.DB.prepare(
+        "UPDATE inventory SET qty = qty + ? WHERE color = ? AND size = ? AND EXISTS (SELECT 1 FROM orders WHERE id = ? AND status != 'Cancelled')"
+      ).bind(l.qty, l.color, l.size, order.id));
+      stmts.push(env.DB.prepare("UPDATE orders SET status = 'Cancelled' WHERE id = ? AND status != 'Cancelled'").bind(order.id));
+      stmts.push(syncTotalStmt(env.DB));
       await env.DB.batch(stmts);
-    } else if (wasCancelled && !nowCancelled) {
-      const taken = [];
+    } else if (order.status === "Cancelled") {
+      const checks = lines.map(() =>
+        "AND EXISTS (SELECT 1 FROM inventory WHERE color = ? AND size = ? AND qty >= ?)"
+      ).join(" ");
+      const reopen = env.DB.prepare(
+        "UPDATE orders SET status = ? WHERE id = ? AND status = 'Cancelled' " + checks
+      ).bind(status, order.id, ...lines.flatMap((l) => [l.color, l.size, l.qty]));
+      const stmts = [reopen];
       for (const l of lines) {
-        if (await takeStock(env.DB, l.color, l.size, l.qty)) { taken.push(l); continue; }
-        for (const back of taken) await addStockStmt(env.DB, back.color, back.size, back.qty).run();
-        throw new HttpError(400, "স্টক না থাকায় অর্ডার আবার চালু করা যাবে না!");
+        stmts.push(env.DB.prepare(
+          "UPDATE inventory SET qty = qty - ? WHERE color = ? AND size = ? AND qty >= ? AND EXISTS (SELECT 1 FROM orders WHERE id = ? AND status = ?)"
+        ).bind(l.qty, l.color, l.size, l.qty, order.id, status));
       }
-      await env.DB.batch([setStatus, syncTotalStmt(env.DB)]);
+      stmts.push(syncTotalStmt(env.DB));
+      const results = await env.DB.batch(stmts);
+      if (results[0]?.meta?.changes !== 1) {
+        const current = await env.DB.prepare("SELECT status FROM orders WHERE id = ?").bind(order.id).first();
+        if (!current) throw new HttpError(404, "অর্ডার পাওয়া যায়নি!");
+        if (current.status === "Cancelled") {
+          for (const l of lines) {
+            const row = await env.DB.prepare("SELECT qty FROM inventory WHERE color = ? AND size = ?")
+              .bind(l.color, l.size).first();
+            if (!row || Number(row.qty) < l.qty) throw new HttpError(400, "স্টক না থাকায় অর্ডার আবার চালু করা যাবে না!");
+          }
+        }
+        throw new HttpError(409, "অর্ডারের অবস্থা পরিবর্তিত হয়েছে, আবার চেষ্টা করুন।");
+      }
     } else {
-      await setStatus.run();
+      const result = await env.DB.prepare(
+        "UPDATE orders SET status = ? WHERE id = ? AND status != 'Cancelled'"
+      ).bind(status, order.id).run();
+      if (!result.meta || result.meta.changes === 0) throw new HttpError(409, "অর্ডারের অবস্থা পরিবর্তিত হয়েছে, আবার চেষ্টা করুন।");
     }
 
     await audit(env, s.username, "order_status", pid + " → " + status, rawIp);
@@ -2062,21 +2140,21 @@ async function apiRoutes(request, env, path) {
     const b = await readJson(request);
     const pid = normalizeSearch(b.publicId);
     if (!PUBLIC_ID_RE.test(pid)) throw new HttpError(400, "অর্ডার আইডি সঠিক নয়!");
-
-    const order = await env.DB.prepare(
-      "SELECT id, status, quantity FROM orders WHERE public_id = ?"
-    ).bind(pid).first();
+    const order = await env.DB.prepare("SELECT id, status, quantity FROM orders WHERE public_id = ?").bind(pid).first();
     if (!order) return json({ success: true });
 
     const lines = await getOrderLines(env, order.id, order.quantity);
     const stmts = [];
     if (order.status !== "Cancelled") {
-      for (const l of lines) stmts.push(addStockStmt(env.DB, l.color, l.size, l.qty));
+      for (const l of lines) {
+        stmts.push(env.DB.prepare(
+          "UPDATE inventory SET qty = qty + ? WHERE color = ? AND size = ? AND EXISTS (SELECT 1 FROM orders WHERE id = ? AND status != 'Cancelled')"
+        ).bind(l.qty, l.color, l.size, order.id));
+      }
     }
     stmts.push(env.DB.prepare("DELETE FROM orders WHERE id = ?").bind(order.id));
     stmts.push(syncTotalStmt(env.DB));
     await env.DB.batch(stmts);
-
     await audit(env, s.username, "order_delete", pid, rawIp);
     return json({ success: true });
   }
@@ -4222,6 +4300,8 @@ function renderAdminHTML(nonce) {
       'ইউজারনেম ও পাসওয়ার্ড দিন!': 'Enter username and password!',
       'ইউজারনেম বা পাসওয়ার্ড ভুল!': 'Wrong username or password!',
       'অনেকবার ভুল চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।': 'Too many failed attempts. Try again later.',
+      'এই উৎস থেকে অনেক অর্ডারের চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।': 'Too many order attempts from this source. Please try again later.',
+      'অর্ডারের অবস্থা পরিবর্তিত হয়েছে, আবার চেষ্টা করুন।': 'The order status changed. Please try again.',
       'নতুন পাসওয়ার্ড আগেরটির থেকে আলাদা হতে হবে!': 'New password must differ from the current one!',
       'নতুন পাসওয়ার্ড ৮–২০০ অক্ষরের হতে হবে!': 'New password must be 8–200 characters!',
       'বর্তমান পাসওয়ার্ড ভুল!': 'Current password is wrong!',
