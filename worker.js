@@ -1920,13 +1920,13 @@ async function apiRoutes(request, env, path) {
     const b = await readJson(request);
     const name = String(b.name ?? "").trim();
     const address = String(b.address ?? "").trim();
-    const phone = String(b.phone ?? "").replace(/[\\s-]/g, "");
+    const phone = String(b.phone ?? "").replace(/[\s-]/g, "");
     const area = b.area;
     const qty = Math.min(MAX_QTY, Math.max(1, toInt(b.quantity, 1)));
 
     if (name.length < 2 || name.length > 100) throw new HttpError(400, "সঠিক নাম লিখুন!");
     if (address.length < 5 || address.length > 500) throw new HttpError(400, "সম্পূর্ণ ঠিকানা লিখুন!");
-    if (!/^01[3-9]\\d{8}$/.test(phone)) throw new HttpError(400, "সঠিক মোবাইল নাম্বার দিন (01XXXXXXXXX)!");
+    if (!/^01[3-9]\d{8}$/.test(phone)) throw new HttpError(400, "সঠিক মোবাইল নাম্বার দিন (01XXXXXXXXX)!");
     if (area !== "inside" && area !== "outside") throw new HttpError(400, "দয়া করে ডেলিভারি এরিয়া সিলেক্ট করুন!");
 
     const phoneIdx = await blindIndex(env, "phone", phone);
